@@ -78,7 +78,7 @@ jobs:
 
       - name: Set GHCR image name
         run: |
-          echo "IMAGE_ID=ghcr.io/suryak252006/student-result-prediction" >> "$GITHUB_ENV"
+          echo "IMAGE_ID=ghcr.io/231fa04132/student-result-prediction" >> "$GITHUB_ENV"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
