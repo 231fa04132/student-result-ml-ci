@@ -1,0 +1,98 @@
+
+name: Practical 9 - Docker GHCR Publish
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate trained model
+        run: python train_model.py
+
+      - name: Check model quality
+        run: python quality_gate.py
+
+      - name: Run automated tests
+        run: python -m unittest discover -v
+
+      - name: Build Docker image
+        run: docker build -t student-result-ml:ci .
+
+      - name: Start test container
+        run: |
+          docker run -d \
+            --name student-result-ci \
+            -p 8000:5000 \
+            student-result-ml:ci
+
+      - name: Verify API health
+        run: |
+          for attempt in {1..20}; do
+            if curl --fail --silent http://localhost:8000/; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Waiting for API..."
+            sleep 3
+          done
+
+          docker logs student-result-ci
+          exit 1
+
+      - name: Test prediction API
+        run: |
+          response=$(curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}' \
+            http://localhost:8000/predict)
+
+          echo "$response"
+          echo "$response" | grep -q '"PASS"'
+          echo "Prediction test passed"
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f student-result-ci || true
+
+      - name: Set GHCR image name
+        run: |
+          echo "IMAGE_ID=ghcr.io/suryak252006/student-result-prediction" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag tested image
+        run: |
+          docker tag student-result-ml:ci "$IMAGE_ID:latest"
+          docker tag student-result-ml:ci "$IMAGE_ID:sha-${{ github.sha }}"
+
+      - name: Publish Docker image
+        run: |
+          docker push "$IMAGE_ID:latest"
+          docker push "$IMAGE_ID:sha-${{ github.sha }}"
