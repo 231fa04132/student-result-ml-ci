@@ -1,3 +1,4 @@
+
 from pathlib import Path
 import logging
 import sys
@@ -6,9 +7,16 @@ import uuid
 
 import joblib
 import pandas as pd
-from flask import Flask, jsonify, request, g
+from flask import Flask, jsonify, request, g, Response
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST
+)
 
-# Configure logging for Render and Docker
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -29,7 +37,30 @@ FEATURES = [
     "previous_score"
 ]
 
-# Cache the model after its first successful load
+# Prometheus metrics
+HTTP_REQUESTS = Counter(
+    "student_api_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"]
+)
+
+HTTP_LATENCY = Histogram(
+    "student_api_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"]
+)
+
+PREDICTIONS = Counter(
+    "student_api_predictions_total",
+    "Total prediction attempts",
+    ["result"]
+)
+
+MODEL_LOADED = Gauge(
+    "student_api_model_loaded",
+    "Whether the model is loaded"
+)
+
 model = None
 
 
@@ -41,30 +72,44 @@ def load_model():
 
     try:
         model = joblib.load(MODEL_PATH)
+        MODEL_LOADED.set(1)
+
         logger.info(
             "event=model_loaded model_file=%s",
             MODEL_PATH.name
         )
+
         return model
 
     except Exception:
+        MODEL_LOADED.set(0)
         logger.exception("event=model_load_failed")
         raise
 
 
-# Log the beginning of each HTTP request
 @app.before_request
 def before_request():
     g.request_id = str(uuid.uuid4())
     g.start_time = time.perf_counter()
 
 
-# Log response status and duration
 @app.after_request
 def after_request(response):
-    duration_ms = (
-        time.perf_counter() - g.start_time
-    ) * 1000
+    duration_seconds = time.perf_counter() - g.start_time
+    duration_ms = duration_seconds * 1000
+
+    # Exclude Prometheus scrapes from user traffic
+    if request.path != "/metrics":
+        HTTP_REQUESTS.labels(
+            method=request.method,
+            path=request.path,
+            status=str(response.status_code)
+        ).inc()
+
+        HTTP_LATENCY.labels(
+            method=request.method,
+            path=request.path
+        ).observe(duration_seconds)
 
     level = (
         logging.WARNING
@@ -87,17 +132,23 @@ def after_request(response):
     return response
 
 
-# Root / health endpoint
 @app.get("/")
 def health_check():
     return jsonify({
         "status": "ok",
         "service": "student-result-prediction",
-        "message": "Practical 11 - Logging Enabled"
+        "message": "Practical 12 - Monitoring Enabled"
     })
 
 
-# Prediction endpoint
+@app.get("/metrics")
+def metrics():
+    return Response(
+        generate_latest(),
+        content_type=CONTENT_TYPE_LATEST
+    )
+
+
 @app.post("/predict")
 def predict():
     data = request.get_json(silent=True)
@@ -144,10 +195,10 @@ def predict():
             for field in FEATURES
         }])
 
-        # Reject invalid numeric input
         for field in FEATURES:
             sample[field] = pd.to_numeric(
-                sample[field], errors="raise"
+                sample[field],
+                errors="raise"
             )
 
     except (ValueError, TypeError):
@@ -165,6 +216,8 @@ def predict():
         trained_model = load_model()
         code = int(trained_model.predict(sample)[0])
 
+        PREDICTIONS.labels(result="success").inc()
+
         logger.info(
             "event=prediction_success request_id=%s "
             "prediction_code=%s",
@@ -178,6 +231,8 @@ def predict():
         })
 
     except Exception:
+        PREDICTIONS.labels(result="error").inc()
+
         logger.exception(
             "event=prediction_failed request_id=%s",
             g.request_id
@@ -188,7 +243,6 @@ def predict():
         }), 500
 
 
-# Log requests to nonexistent endpoints
 @app.errorhandler(404)
 def route_not_found(error):
     logger.warning(
